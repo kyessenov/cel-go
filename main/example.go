@@ -2,18 +2,19 @@ package main
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/go-interpreter/wagon/disasm"
 	"github.com/go-interpreter/wagon/exec"
 	"github.com/go-interpreter/wagon/wasm"
-	ops "github.com/go-interpreter/wagon/wasm/operators"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
+	gen "github.com/google/cel-go/wasm"
 )
 
 const (
-	test = `1 + 1 == 2`
+	test = `true`
 )
 
 func main() {
@@ -32,18 +33,11 @@ func main() {
 	out, _, _ := prg.Eval(map[string]interface{}{})
 	fmt.Printf("CEL value: %v\n", out)
 
-	module := &wasm.Module{}
-	module.FunctionIndexSpace = []wasm.Function{{
-		Sig: &wasm.FunctionSig{
-			ParamTypes:  []wasm.ValueType{},
-			ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
-		},
-		Body: &wasm.FunctionBody{
-			Module: module,
-			Code:   getCode(),
-		},
-	}}
-
+	instrs, err := gen.Plan(expr)
+	if err != nil {
+		panic(err)
+	}
+	module := makeModule(assemble(instrs))
 	vm, err := exec.NewVM(module)
 	if err != nil {
 		panic(err)
@@ -55,23 +49,74 @@ func main() {
 	fmt.Printf("WASM value: %v\n", o)
 }
 
-func getCode() []byte {
-	out, err := disasm.Assemble([]disasm.Instr{{
-		Op:         op(ops.I64Const),
-		Immediates: []interface{}{int64(42)},
-	}, {
-		Op:         op(ops.I64Const),
-		Immediates: []interface{}{int64(42)},
-	}, {
-		Op: op(ops.I64Add),
-	}})
+func assemble(instrs []disasm.Instr) []byte {
+	out, err := disasm.Assemble(instrs)
 	if err != nil {
 		panic(err)
 	}
 	return out
 }
 
-func op(o byte) ops.Op {
-	out, _ := ops.New(o)
-	return out
+// a host function that can be called by WASM code.
+func testHostFunction(proc *exec.Process) {
+	fmt.Println("executing host function")
+}
+
+func makeModule(code []byte) *wasm.Module {
+	m := wasm.NewModule()
+
+	fsig := wasm.FunctionSig{
+		Form:        0,
+		ParamTypes:  []wasm.ValueType{},
+		ReturnTypes: []wasm.ValueType{},
+	}
+	fsig1 := wasm.FunctionSig{
+		Form:        0,
+		ParamTypes:  []wasm.ValueType{},
+		ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
+	}
+
+	// List of all function types available in this module.
+	// There is only one: (func [] -> [])
+	m.Types = &wasm.SectionTypes{
+		Entries: []wasm.FunctionSig{
+			fsig1,
+			fsig,
+		},
+	}
+
+	m.Function = &wasm.SectionFunctions{
+		Types: []uint32{1, 0},
+	}
+
+	// The body of the start function, that should only
+	// call the host function
+	fb := wasm.FunctionBody{
+		Module: m,
+		Locals: []wasm.LocalEntry{},
+		// code should disassemble to:
+		// call 1 (which is host)
+		// end
+		Code: code,
+	}
+
+	// There was no call to `ReadModule` so this part emulates
+	// how the module object would look like if the function
+	// had been called.
+	m.FunctionIndexSpace = []wasm.Function{
+		{
+			Sig:  &fsig1,
+			Body: &fb,
+		},
+		{
+			Sig:  &fsig,
+			Host: reflect.ValueOf(testHostFunction),
+		},
+	}
+
+	m.Code = &wasm.SectionCode{
+		Bodies: []wasm.FunctionBody{fb},
+	}
+
+	return m
 }

@@ -15,6 +15,7 @@
 package wasm
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/go-interpreter/wagon/disasm"
@@ -35,11 +36,11 @@ type Interpretable = interpreter.Interpretable
 type Activation = interpreter.Activation
 type Instructions = []disasm.Instr
 
-// newPlanner creates an interpretablePlanner which references a Dispatcher, TypeProvider,
+// NewPlanner creates an interpretablePlanner which references a Dispatcher, TypeProvider,
 // TypeAdapter, Packager, and CheckedExpr value. These pieces of data are used to resolve
 // functions, types, and namespaced identifiers at plan time rather than at runtime since
 // it only needs to be done once and may be semi-expensive to compute.
-func newPlanner(disp interpreter.Dispatcher,
+func NewPlanner(disp interpreter.Dispatcher,
 	provider ref.TypeProvider,
 	adapter ref.TypeAdapter,
 	pkg packages.Packager,
@@ -64,6 +65,11 @@ type planner struct {
 	identMap map[string]Interpretable
 	refMap   map[int64]*exprpb.Reference
 	typeMap  map[int64]*exprpb.Type
+}
+
+func Plan(checked *exprpb.CheckedExpr) (Instructions, error) {
+	planner := NewPlanner(nil, nil, nil, nil, checked)
+	return planner.Plan(checked.Expr)
 }
 
 // Plan implements the interpretablePlanner interface. This implementation of the Plan method also
@@ -147,10 +153,13 @@ func (p *planner) planSelect(expr *exprpb.Expr) (Interpretable, error) {
 		idName := idRef.Name
 		// If the reference has a value, this id represents an enum.
 		if idRef.Value != nil {
-			return p.Plan(&exprpb.Expr{Id: expr.Id,
-				ExprKind: &exprpb.Expr_ConstExpr{
-					ConstExpr: idRef.Value,
-				}})
+			// TODO
+			/*
+				return p.Plan(&exprpb.Expr{Id: expr.Id,
+					ExprKind: &exprpb.Expr_ConstExpr{
+						ConstExpr: idRef.Value,
+					}})
+			*/
 		}
 		// If the identifier has already been encountered before, return the previous Iterable.
 		i, found := p.identMap[idName]
@@ -167,20 +176,23 @@ func (p *planner) planSelect(expr *exprpb.Expr) (Interpretable, error) {
 	}
 
 	// Lastly, create a field selection Interpretable.
-	op, err := p.Plan(sel.GetOperand())
-	if err != nil {
-		return nil, err
-	}
-	var resolver func(Activation) (ref.Val, bool)
-	if qualID, isID := p.getQualifiedID(sel); isID {
-		resolver = p.idResolver(qualID)
-	}
-	return &evalSelect{
-		id:        expr.Id,
-		field:     types.String(sel.Field),
-		op:        op,
-		resolveID: resolver,
-	}, nil
+	/*
+		op, err := p.Plan(sel.GetOperand())
+		if err != nil {
+			return nil, err
+		}
+		var resolver func(Activation) (ref.Val, bool)
+		if qualID, isID := p.getQualifiedID(sel); isID {
+			resolver = p.idResolver(qualID)
+		}
+		return &evalSelect{
+			id:    expr.Id,
+			field: types.String(sel.Field),
+			op:        op,
+			resolveID: resolver,
+		}, nil
+	*/
+	return nil, errors.New("not implemented")
 }
 
 // planCall creates a callable Interpretable while specializing for common functions and invocation
@@ -202,20 +214,22 @@ func (p *planner) planCall(expr *exprpb.Expr) (Interpretable, error) {
 		offset++
 	}
 	args := make([]Interpretable, argCount, argCount)
-	if call.Target != nil {
-		arg, err := p.Plan(call.Target)
-		if err != nil {
-			return nil, err
+	/*
+		if call.Target != nil {
+			arg, err := p.Plan(call.Target)
+			if err != nil {
+				return nil, err
+			}
+			args[0] = arg
 		}
-		args[0] = arg
-	}
-	for i, argExpr := range call.GetArgs() {
-		arg, err := p.Plan(argExpr)
-		if err != nil {
-			return nil, err
+		for i, argExpr := range call.GetArgs() {
+			arg, err := p.Plan(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			args[i+offset] = arg
 		}
-		args[i+offset] = arg
-	}
+	*/
 
 	// Generate specialized Interpretable operators by function name if possible.
 	switch fnName {
@@ -389,13 +403,15 @@ func (p *planner) planCallConditional(expr *exprpb.Expr,
 func (p *planner) planCreateList(expr *exprpb.Expr) (Interpretable, error) {
 	list := expr.GetListExpr()
 	elems := make([]Interpretable, len(list.GetElements()), len(list.GetElements()))
-	for i, elem := range list.GetElements() {
-		elemVal, err := p.Plan(elem)
-		if err != nil {
-			return nil, err
+	/*
+		for i, elem := range list.GetElements() {
+			elemVal, err := p.Plan(elem)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = elemVal
 		}
-		elems[i] = elemVal
-	}
+	*/
 	return &evalList{
 		id:      expr.Id,
 		elems:   elems,
@@ -412,19 +428,21 @@ func (p *planner) planCreateStruct(expr *exprpb.Expr) (Interpretable, error) {
 	entries := str.GetEntries()
 	keys := make([]Interpretable, len(entries))
 	vals := make([]Interpretable, len(entries))
-	for i, entry := range entries {
-		keyVal, err := p.Plan(entry.GetMapKey())
-		if err != nil {
-			return nil, err
-		}
-		keys[i] = keyVal
+	/*
+		for i, entry := range entries {
+			keyVal, err := p.Plan(entry.GetMapKey())
+			if err != nil {
+				return nil, err
+			}
+			keys[i] = keyVal
 
-		valVal, err := p.Plan(entry.GetValue())
-		if err != nil {
-			return nil, err
+			valVal, err := p.Plan(entry.GetValue())
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = valVal
 		}
-		vals[i] = valVal
-	}
+	*/
 	return &evalMap{
 		id:      expr.Id,
 		keys:    keys,
@@ -451,14 +469,16 @@ func (p *planner) planCreateObj(expr *exprpb.Expr) (Interpretable, error) {
 	entries := obj.GetEntries()
 	fields := make([]string, len(entries))
 	vals := make([]Interpretable, len(entries))
-	for i, entry := range entries {
-		fields[i] = entry.GetFieldKey()
-		val, err := p.Plan(entry.GetValue())
-		if err != nil {
-			return nil, err
+	/*
+		for i, entry := range entries {
+			fields[i] = entry.GetFieldKey()
+			val, err := p.Plan(entry.GetValue())
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = val
 		}
-		vals[i] = val
-	}
+	*/
 	return &evalObj{
 		id:       expr.Id,
 		typeName: typeName,
@@ -601,7 +621,7 @@ func (sel *evalSelect) Eval(ctx Activation) ref.Val {
 
 type evalTestOnly struct {
 	id    int64
-	op    Interpretable
+	op    Instructions
 	field types.String
 }
 
@@ -612,16 +632,18 @@ func (test *evalTestOnly) ID() int64 {
 
 // Eval implements the Interpretable interface method.
 func (test *evalTestOnly) Eval(ctx Activation) ref.Val {
-	obj := test.op.Eval(ctx)
-	tester, ok := obj.(traits.FieldTester)
-	if ok {
-		return tester.IsSet(test.field)
-	}
-	container, ok := obj.(traits.Container)
-	if ok {
-		return container.Contains(test.field)
-	}
-	return types.ValOrErr(obj, "invalid type for field selection.")
+	/*
+		obj := test.op.Eval(ctx)
+		tester, ok := obj.(traits.FieldTester)
+		if ok {
+			return tester.IsSet(test.field)
+		}
+		container, ok := obj.(traits.Container)
+		if ok {
+			return container.Contains(test.field)
+		}
+	*/
+	return types.ValOrErr(types.Bool(true), "invalid type for field selection.")
 
 }
 
