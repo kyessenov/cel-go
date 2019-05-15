@@ -4,6 +4,7 @@ go 1.12
 
 require (
 	github.com/antlr/antlr4 v0.0.0-20190223165740-dade65a895c2
+	github.com/go-interpreter/wagon v0.4.0
 	github.com/golang/protobuf v1.3.0
 	github.com/google/cel-spec v0.2.0
 	golang.org/x/text v0.3.0
