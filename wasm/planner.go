@@ -19,9 +19,10 @@ import (
 	"fmt"
 
 	"github.com/go-interpreter/wagon/disasm"
+	"github.com/go-interpreter/wagon/wasm"
 	ops "github.com/go-interpreter/wagon/wasm/operators"
 
-	"github.com/google/cel-go/common/operators"
+	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/packages"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
@@ -36,17 +37,12 @@ type Interpretable = interpreter.Interpretable
 type Activation = interpreter.Activation
 type Instructions = []disasm.Instr
 
-// NewPlanner creates an interpretablePlanner which references a Dispatcher, TypeProvider,
-// TypeAdapter, Packager, and CheckedExpr value. These pieces of data are used to resolve
-// functions, types, and namespaced identifiers at plan time rather than at runtime since
-// it only needs to be done once and may be semi-expensive to compute.
-func NewPlanner(disp interpreter.Dispatcher,
+func NewPlanner(
 	provider ref.TypeProvider,
 	adapter ref.TypeAdapter,
 	pkg packages.Packager,
 	checked *exprpb.CheckedExpr) *planner {
 	return &planner{
-		disp:     disp,
 		provider: provider,
 		adapter:  adapter,
 		pkg:      pkg,
@@ -58,7 +54,6 @@ func NewPlanner(disp interpreter.Dispatcher,
 
 // planner is an implementatio of the interpretablePlanner interface.
 type planner struct {
-	disp     interpreter.Dispatcher
 	provider ref.TypeProvider
 	adapter  ref.TypeAdapter
 	pkg      packages.Packager
@@ -67,8 +62,8 @@ type planner struct {
 	typeMap  map[int64]*exprpb.Type
 }
 
-func Plan(checked *exprpb.CheckedExpr) (Instructions, error) {
-	planner := NewPlanner(nil, nil, nil, nil, checked)
+func Plan(checked *exprpb.CheckedExpr) Instructions {
+	planner := NewPlanner(nil, nil, nil, checked)
 	return planner.Plan(checked.Expr)
 }
 
@@ -77,10 +72,10 @@ func Plan(checked *exprpb.CheckedExpr) (Instructions, error) {
 // useful for layering functionality into the evaluation that is not natively understood by CEL,
 // such as state-tracking, expression re-write, and possibly efficient thread-safe memoization of
 // repeated expressions.
-func (p *planner) Plan(expr *exprpb.Expr) (Instructions, error) {
+func (p *planner) Plan(expr *exprpb.Expr) Instructions {
 	switch expr.ExprKind.(type) {
 	case *exprpb.Expr_CallExpr:
-		p.planCall(expr)
+		return p.planCall(expr)
 	case *exprpb.Expr_IdentExpr:
 		p.planIdent(expr)
 	case *exprpb.Expr_SelectExpr:
@@ -92,7 +87,7 @@ func (p *planner) Plan(expr *exprpb.Expr) (Instructions, error) {
 	case *exprpb.Expr_ConstExpr:
 		return p.planConst(expr)
 	}
-	return nil, fmt.Errorf("unsupported expr: %v", expr)
+	panic(fmt.Sprintf("unsupported expr: %v", expr))
 }
 
 // planIdent creates an Interpretable that resolves an identifier from an Activation.
@@ -135,10 +130,7 @@ func (p *planner) planSelect(expr *exprpb.Expr) (Interpretable, error) {
 	// it is not clear whether has should error or follow the convention defined for structured
 	// values.
 	if sel.TestOnly {
-		op, err := p.Plan(sel.GetOperand())
-		if err != nil {
-			return nil, err
-		}
+		op := p.Plan(sel.GetOperand())
 		return &evalTestOnly{
 			id:    expr.Id,
 			field: types.String(sel.Field),
@@ -198,64 +190,168 @@ func (p *planner) planSelect(expr *exprpb.Expr) (Interpretable, error) {
 // planCall creates a callable Interpretable while specializing for common functions and invocation
 // patterns. Specifically, conditional operators &&, ||, ?:, and (in)equality functions result in
 // optimized Interpretable values.
-func (p *planner) planCall(expr *exprpb.Expr) (Interpretable, error) {
+func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 	call := expr.GetCallExpr()
+	args := call.GetArgs()
+
 	var oName string
 	if oRef, found := p.refMap[expr.Id]; found &&
 		len(oRef.GetOverloadId()) == 1 {
 		oName = oRef.GetOverloadId()[0]
+
+		out := make(Instructions, 0)
+		// generate raw code using the overload function
+		switch oName {
+		/*
+		   Triple-value boolean logic
+		   i32 data value
+		   0 false
+		   1 true
+		   2+ error code
+		*/
+		case overloads.Conditional:
+			// TODO: add error case to br_table
+
+			// else block
+			out = append(out, do(ops.Block, wasm.BlockType(wasm.ValueTypeI32)))
+			// then block
+			out = append(out, do(ops.Block, wasm.BlockType(wasm.ValueTypeI32)))
+			out = append(out, do(ops.I32Const, int32(0))) // popped by br_table
+			// if block
+			out = append(out, do(ops.Block, wasm.BlockTypeEmpty))
+			cond := p.Plan(args[0])
+			out = append(out, cond...)
+			out = append(out, do(ops.BrTable, uint32(1), uint32(1), uint32(0)))
+			out = append(out, do(ops.End))
+			// end if block
+
+			out = append(out, do(ops.Drop))
+			truthy := p.Plan(args[1])
+			out = append(out, truthy...)
+			out = append(out, do(ops.Br, uint32(1)))
+			out = append(out, do(ops.End))
+			// end then block
+
+			falsy := p.Plan(args[2])
+			out = append(out, falsy...)
+			out = append(out, do(ops.End))
+			// end else block
+
+			return out
+
+		case overloads.LogicalAnd:
+			// short-circuit lhs.
+			out = append(out, do(ops.Block, wasm.BlockType(wasm.ValueTypeI32)))
+			lhs, err := p.Plan(args[0])
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, lhs...)
+
+			// if value is 0, break
+
+			out = append(out, do(ops.End))
+
+			lVal := and.lhs.Eval(ctx)
+			lBool, lok := lVal.(types.Bool)
+			if lok && lBool == types.False {
+				return types.False
+			}
+			// short-circuit on rhs.
+			rVal := and.rhs.Eval(ctx)
+			rBool, rok := rVal.(types.Bool)
+			if rok && rBool == types.False {
+				return types.False
+			}
+			// return if both sides are bool true.
+			if lok && rok {
+				return types.True
+			}
+
+		case overloads.AddInt64:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, p.Plan(args[1])...)
+			out = append(out, do(ops.I64Add))
+			return out
+		case overloads.AddDouble:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, p.Plan(args[1])...)
+			out = append(out, do(ops.F64Add))
+			return out
+		case overloads.MultiplyInt64:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, p.Plan(args[1])...)
+			out = append(out, do(ops.I64Mul))
+			return out
+		case overloads.MultiplyDouble:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, p.Plan(args[1])...)
+			out = append(out, do(ops.F64Mul))
+			return out
+
+			// TODO: partial semantics
+		case overloads.DivideDouble:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, p.Plan(args[1])...)
+			out = append(out, do(ops.F64Div))
+			return out
+
+		case overloads.DoubleToInt:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, do(ops.I64TruncSF64))
+			return out
+
+		case overloads.EqualsInt64:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, p.Plan(args[1])...)
+			out = append(out, do(ops.I64Eq))
+			return out
+
+			// TODO: all the other functions...
+		}
 	}
+
 	fnName := call.Function
-	fnDef, _ := p.disp.FindOverload(fnName)
+	fmt.Printf("overload %q function %q\n", oName, fnName)
+
 	argCount := len(call.GetArgs())
 	var offset int
 	if call.Target != nil {
 		argCount++
 		offset++
 	}
-	args := make([]Interpretable, argCount, argCount)
 	/*
-		if call.Target != nil {
-			arg, err := p.Plan(call.Target)
-			if err != nil {
-				return nil, err
+		args := make([]Interpretable, argCount, argCount)
+			if call.Target != nil {
+				arg, err := p.Plan(call.Target)
+				if err != nil {
+					return nil, err
+				}
+				args[0] = arg
 			}
-			args[0] = arg
-		}
-		for i, argExpr := range call.GetArgs() {
-			arg, err := p.Plan(argExpr)
-			if err != nil {
-				return nil, err
+			for i, argExpr := range call.GetArgs() {
+				arg, err := p.Plan(argExpr)
+				if err != nil {
+					return nil, err
+				}
+				args[i+offset] = arg
 			}
-			args[i+offset] = arg
-		}
 	*/
 
-	// Generate specialized Interpretable operators by function name if possible.
-	switch fnName {
-	case operators.LogicalAnd:
-		return p.planCallLogicalAnd(expr, args)
-	case operators.LogicalOr:
-		return p.planCallLogicalOr(expr, args)
-	case operators.Conditional:
-		return p.planCallConditional(expr, args)
-	case operators.Equals:
-		return p.planCallEqual(expr, args)
-	case operators.NotEquals:
-		return p.planCallNotEqual(expr, args)
-	}
-
-	// Otherwise, generate Interpretable calls specialized by argument count.
-	switch argCount {
-	case 0:
-		return p.planCallZero(expr, fnName, oName, fnDef)
-	case 1:
-		return p.planCallUnary(expr, fnName, oName, fnDef, args)
-	case 2:
-		return p.planCallBinary(expr, fnName, oName, fnDef, args)
-	default:
-		return p.planCallVarArgs(expr, fnName, oName, fnDef, args)
-	}
+	panic("not implemented")
+	/*
+		// Otherwise, generate Interpretable calls specialized by argument count.
+		switch argCount {
+		case 0:
+			return p.planCallZero(expr, fnName, oName, fnDef)
+		case 1:
+			return p.planCallUnary(expr, fnName, oName, fnDef, args)
+		case 2:
+			return p.planCallBinary(expr, fnName, oName, fnDef, args)
+		default:
+			return p.planCallVarArgs(expr, fnName, oName, fnDef, args)
+		}
+	*/
 }
 
 // planCallZero generates a zero-arity callable Interpretable.
@@ -345,57 +441,6 @@ func (p *planner) planCallVarArgs(expr *exprpb.Expr,
 		args:     args,
 		trait:    trait,
 		impl:     fn,
-	}, nil
-}
-
-// planCallEqual generates an equals (==) Interpretable.
-func (p *planner) planCallEqual(expr *exprpb.Expr,
-	args []Interpretable) (Interpretable, error) {
-	return &evalEq{
-		id:  expr.Id,
-		lhs: args[0],
-		rhs: args[1],
-	}, nil
-}
-
-// planCallNotEqual generates a not equals (!=) Interpretable.
-func (p *planner) planCallNotEqual(expr *exprpb.Expr,
-	args []Interpretable) (Interpretable, error) {
-	return &evalNe{
-		id:  expr.Id,
-		lhs: args[0],
-		rhs: args[1],
-	}, nil
-}
-
-// planCallLogicalAnd generates a logical and (&&) Interpretable.
-func (p *planner) planCallLogicalAnd(expr *exprpb.Expr,
-	args []Interpretable) (Interpretable, error) {
-	return &evalAnd{
-		id:  expr.Id,
-		lhs: args[0],
-		rhs: args[1],
-	}, nil
-}
-
-// planCallLogicalOr generates a logical or (||) Interpretable.
-func (p *planner) planCallLogicalOr(expr *exprpb.Expr,
-	args []Interpretable) (Interpretable, error) {
-	return &evalOr{
-		id:  expr.Id,
-		lhs: args[0],
-		rhs: args[1],
-	}, nil
-}
-
-// planCallConditional generates a conditional / ternary (c ? t : f) Interpretable.
-func (p *planner) planCallConditional(expr *exprpb.Expr,
-	args []Interpretable) (Interpretable, error) {
-	return &evalConditional{
-		id:     expr.Id,
-		expr:   args[0],
-		truthy: args[1],
-		falsy:  args[2],
 	}, nil
 }
 
@@ -489,23 +534,23 @@ func (p *planner) planCreateObj(expr *exprpb.Expr) (Interpretable, error) {
 }
 
 // planConst generates a constant valued Interpretable.
-func (p *planner) planConst(expr *exprpb.Expr) (Instructions, error) {
+func (p *planner) planConst(expr *exprpb.Expr) Instructions {
 	c := expr.GetConstExpr()
 	switch c.ConstantKind.(type) {
 	case *exprpb.Constant_BoolValue:
 		if c.GetBoolValue() {
-			return Instructions{do(ops.I32Const, int32(1))}, nil
+			return Instructions{do(ops.I32Const, int32(1))}
 		} else {
-			return Instructions{do(ops.I32Const, int32(0))}, nil
+			return Instructions{do(ops.I32Const, int32(0))}
 		}
 	case *exprpb.Constant_DoubleValue:
-		return Instructions{do(ops.F64Const, c.GetDoubleValue())}, nil
+		return Instructions{do(ops.F64Const, c.GetDoubleValue())}
 	case *exprpb.Constant_Int64Value:
-		return Instructions{do(ops.I64Const, c.GetInt64Value())}, nil
+		return Instructions{do(ops.I64Const, c.GetInt64Value())}
 	case *exprpb.Constant_NullValue:
-		return Instructions{do(ops.I64Const, int64(0))}, nil
+		return Instructions{do(ops.I64Const, int64(0))}
 	case *exprpb.Constant_Uint64Value:
-		return Instructions{do(ops.I64Const, int64(c.GetUint64Value()))}, nil
+		return Instructions{do(ops.I64Const, int64(c.GetUint64Value()))}
 		/* TODO
 		case *exprpb.Constant_StringValue:
 			return types.String(c.GetStringValue()), nil
@@ -513,7 +558,7 @@ func (p *planner) planConst(expr *exprpb.Expr) (Instructions, error) {
 			return types.Bytes(c.GetBytesValue()), nil
 		*/
 	}
-	return nil, fmt.Errorf("unknown constant type: %v", c)
+	panic(fmt.Sprintf("unknown constant type: %v", c))
 }
 
 // getQualifiedId converts a Select expression to a qualified identifier suitable for identifier
@@ -692,110 +737,6 @@ type evalAnd struct {
 	id  int64
 	lhs Interpretable
 	rhs Interpretable
-}
-
-// ID implements the Interpretable interface method.
-func (and *evalAnd) ID() int64 {
-	return and.id
-}
-
-// Eval implements the Interpretable interface method.
-func (and *evalAnd) Eval(ctx Activation) ref.Val {
-	// short-circuit lhs.
-	lVal := and.lhs.Eval(ctx)
-	lBool, lok := lVal.(types.Bool)
-	if lok && lBool == types.False {
-		return types.False
-	}
-	// short-circuit on rhs.
-	rVal := and.rhs.Eval(ctx)
-	rBool, rok := rVal.(types.Bool)
-	if rok && rBool == types.False {
-		return types.False
-	}
-	// return if both sides are bool true.
-	if lok && rok {
-		return types.True
-	}
-	// TODO: return both values as a set if both are unknown or error.
-	// prefer left unknown to right unknown.
-	if types.IsUnknown(lVal) {
-		return lVal
-	}
-	if types.IsUnknown(rVal) {
-		return rVal
-	}
-	// if the left-hand side is non-boolean return it as the error.
-	return types.ValOrErr(lVal, "no such overload")
-}
-
-type evalConditional struct {
-	id     int64
-	expr   Interpretable
-	truthy Interpretable
-	falsy  Interpretable
-}
-
-// ID implements the Interpretable interface method.
-func (cond *evalConditional) ID() int64 {
-	return cond.id
-}
-
-// Eval implements the Interpretable interface method.
-func (cond *evalConditional) Eval(ctx Activation) ref.Val {
-	condVal := cond.expr.Eval(ctx)
-	condBool, ok := condVal.(types.Bool)
-	if !ok {
-		return types.ValOrErr(condVal, "no such overload")
-	}
-	if condBool {
-		return cond.truthy.Eval(ctx)
-	}
-	return cond.falsy.Eval(ctx)
-}
-
-type evalEq struct {
-	id  int64
-	lhs Interpretable
-	rhs Interpretable
-}
-
-// ID implements the Interpretable interface method.
-func (eq *evalEq) ID() int64 {
-	return eq.id
-}
-
-// Eval implements the Interpretable interface method.
-func (eq *evalEq) Eval(ctx Activation) ref.Val {
-	lVal := eq.lhs.Eval(ctx)
-	rVal := eq.rhs.Eval(ctx)
-	return lVal.Equal(rVal)
-}
-
-type evalNe struct {
-	id  int64
-	lhs Interpretable
-	rhs Interpretable
-}
-
-// ID implements the Interpretable interface method.
-func (ne *evalNe) ID() int64 {
-	return ne.id
-}
-
-// Eval implements the Interpretable interface method.
-func (ne *evalNe) Eval(ctx Activation) ref.Val {
-	lVal := ne.lhs.Eval(ctx)
-	rVal := ne.rhs.Eval(ctx)
-	eqVal := lVal.Equal(rVal)
-	eqBool, ok := eqVal.(types.Bool)
-	if !ok {
-		if types.IsUnknown(eqVal) {
-			return eqVal
-		}
-		return types.NewErr("no such overload: _!=_")
-	}
-	return !eqBool
 }
 
 type evalZeroArity struct {

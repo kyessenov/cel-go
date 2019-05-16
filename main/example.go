@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 
 	"github.com/go-interpreter/wagon/disasm"
@@ -14,12 +15,17 @@ import (
 )
 
 const (
-	test = `true`
+	test = `true ? true && false : false`
 )
 
 func main() {
+	input := test
+	if len(os.Args) > 1 {
+		input = os.Args[1]
+	}
+
 	env, _ := cel.NewEnv()
-	parsed, iss := env.Parse(test)
+	parsed, iss := env.Parse(input)
 	if iss != nil {
 		panic(iss.Err())
 	}
@@ -33,10 +39,7 @@ func main() {
 	out, _, _ := prg.Eval(map[string]interface{}{})
 	fmt.Printf("CEL value: %v\n", out)
 
-	instrs, err := gen.Plan(expr)
-	if err != nil {
-		panic(err)
-	}
+	instrs := gen.Plan(expr)
 	module := makeModule(assemble(instrs))
 	vm, err := exec.NewVM(module)
 	if err != nil {
@@ -65,28 +68,15 @@ func testHostFunction(proc *exec.Process) {
 func makeModule(code []byte) *wasm.Module {
 	m := wasm.NewModule()
 
-	fsig := wasm.FunctionSig{
+	env := wasm.FunctionSig{
 		Form:        0,
 		ParamTypes:  []wasm.ValueType{},
 		ReturnTypes: []wasm.ValueType{},
 	}
-	fsig1 := wasm.FunctionSig{
+	main := wasm.FunctionSig{
 		Form:        0,
 		ParamTypes:  []wasm.ValueType{},
 		ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
-	}
-
-	// List of all function types available in this module.
-	// There is only one: (func [] -> [])
-	m.Types = &wasm.SectionTypes{
-		Entries: []wasm.FunctionSig{
-			fsig1,
-			fsig,
-		},
-	}
-
-	m.Function = &wasm.SectionFunctions{
-		Types: []uint32{1, 0},
 	}
 
 	// The body of the start function, that should only
@@ -94,26 +84,19 @@ func makeModule(code []byte) *wasm.Module {
 	fb := wasm.FunctionBody{
 		Module: m,
 		Locals: []wasm.LocalEntry{},
-		// code should disassemble to:
-		// call 1 (which is host)
-		// end
-		Code: code,
+		Code:   code,
 	}
 
-	// There was no call to `ReadModule` so this part emulates
-	// how the module object would look like if the function
-	// had been called.
 	m.FunctionIndexSpace = []wasm.Function{
 		{
-			Sig:  &fsig1,
+			Sig:  &main,
 			Body: &fb,
 		},
 		{
-			Sig:  &fsig,
+			Sig:  &env,
 			Host: reflect.ValueOf(testHostFunction),
 		},
 	}
-
 	m.Code = &wasm.SectionCode{
 		Bodies: []wasm.FunctionBody{fb},
 	}
