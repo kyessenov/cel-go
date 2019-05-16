@@ -23,7 +23,6 @@ import (
 	ops "github.com/go-interpreter/wagon/wasm/operators"
 
 	"github.com/google/cel-go/common/overloads"
-	"github.com/google/cel-go/common/packages"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/common/types/traits"
@@ -40,15 +39,13 @@ type Instructions = []disasm.Instr
 func NewPlanner(
 	provider ref.TypeProvider,
 	adapter ref.TypeAdapter,
-	pkg packages.Packager,
 	checked *exprpb.CheckedExpr) *planner {
 	return &planner{
 		provider: provider,
 		adapter:  adapter,
-		pkg:      pkg,
-		identMap: make(map[string]Interpretable),
 		refMap:   checked.GetReferenceMap(),
 		typeMap:  checked.GetTypeMap(),
+		identMap: make(map[string]*Ident),
 	}
 }
 
@@ -56,15 +53,22 @@ func NewPlanner(
 type planner struct {
 	provider ref.TypeProvider
 	adapter  ref.TypeAdapter
-	pkg      packages.Packager
-	identMap map[string]Interpretable
 	refMap   map[int64]*exprpb.Reference
 	typeMap  map[int64]*exprpb.Type
+
+	identMap map[string]*Ident
+	idents   []*Ident
 }
 
-func Plan(checked *exprpb.CheckedExpr) Instructions {
-	planner := NewPlanner(nil, nil, nil, checked)
-	return planner.Plan(checked.Expr)
+type Ident struct {
+	val string
+	typ *exprpb.Type
+	id  uint32
+}
+
+func Plan(checked *exprpb.CheckedExpr) (Instructions, []*Ident) {
+	planner := NewPlanner(nil, nil, checked)
+	return planner.Plan(checked.Expr), planner.idents
 }
 
 // Plan implements the interpretablePlanner interface. This implementation of the Plan method also
@@ -77,7 +81,7 @@ func (p *planner) Plan(expr *exprpb.Expr) Instructions {
 	case *exprpb.Expr_CallExpr:
 		return p.planCall(expr)
 	case *exprpb.Expr_IdentExpr:
-		p.planIdent(expr)
+		return p.planIdent(expr)
 	case *exprpb.Expr_SelectExpr:
 		p.planSelect(expr)
 	case *exprpb.Expr_ListExpr:
@@ -91,25 +95,19 @@ func (p *planner) Plan(expr *exprpb.Expr) Instructions {
 }
 
 // planIdent creates an Interpretable that resolves an identifier from an Activation.
-func (p *planner) planIdent(expr *exprpb.Expr) (Interpretable, error) {
-	ident := expr.GetIdentExpr()
-	idName := ident.Name
-	i, found := p.identMap[idName]
-	if found {
-		return i, nil
+func (p *planner) planIdent(expr *exprpb.Expr) Instructions {
+	name := expr.GetIdentExpr().Name
+	id, found := p.identMap[name]
+	if !found {
+		id = &Ident{
+			val: name,
+			typ: p.typeMap[expr.Id],
+			id:  uint32(len(p.idents) + 1),
+		}
+		p.identMap[name] = id
+		p.idents = append(p.idents, id)
 	}
-	var resolver func(Activation) (ref.Val, bool)
-	if p.pkg.Package() != "" {
-		resolver = p.idResolver(idName)
-	}
-	i = &evalIdent{
-		id:        expr.Id,
-		name:      idName,
-		provider:  p.provider,
-		resolveID: resolver,
-	}
-	p.identMap[idName] = i
-	return i, nil
+	return Instructions{do(ops.Call, id.id)}
 }
 
 // planSelect creates an Interpretable with either:
@@ -141,30 +139,25 @@ func (p *planner) planSelect(expr *exprpb.Expr) (Interpretable, error) {
 	// If the Select id appears in the reference map from the CheckedExpr proto then it is either
 	// a namespaced identifier or enum value.
 	idRef, found := p.refMap[expr.Id]
+	_ = idRef
 	if found {
-		idName := idRef.Name
-		// If the reference has a value, this id represents an enum.
-		if idRef.Value != nil {
-			// TODO
-			/*
-				return p.Plan(&exprpb.Expr{Id: expr.Id,
-					ExprKind: &exprpb.Expr_ConstExpr{
-						ConstExpr: idRef.Value,
-					}})
-			*/
-		}
-		// If the identifier has already been encountered before, return the previous Iterable.
-		i, found := p.identMap[idName]
-		if found {
+		// TODO
+		/*
+			idName := idRef.Name
+			// If the reference has a value, this id represents an enum.
+			if idRef.Value != nil {
+					return p.Plan(&exprpb.Expr{Id: expr.Id,
+						ExprKind: &exprpb.Expr_ConstExpr{
+							ConstExpr: idRef.Value,
+						}})
+			}
+			// Otherwise, generate an evalIdent Interpretable.
+			i := &evalIdent{
+				id:   expr.Id,
+				name: idName,
+			}
 			return i, nil
-		}
-		// Otherwise, generate an evalIdent Interpretable.
-		i = &evalIdent{
-			id:   expr.Id,
-			name: idName,
-		}
-		p.identMap[idName] = i
-		return i, nil
+		*/
 	}
 
 	// Lastly, create a field selection Interpretable.
@@ -181,7 +174,6 @@ func (p *planner) planSelect(expr *exprpb.Expr) (Interpretable, error) {
 			id:    expr.Id,
 			field: types.String(sel.Field),
 			op:        op,
-			resolveID: resolver,
 		}, nil
 	*/
 	return nil, errors.New("not implemented")
@@ -203,11 +195,11 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 		// generate raw code using the overload function
 		switch oName {
 		/*
-		   Triple-value boolean logic
-		   i32 data value
-		   0 false
-		   1 true
-		   2+ error code
+			Triple-value boolean logic
+			i32 data value
+			0 false
+			1 true
+			2+ error code
 		*/
 		case overloads.Conditional:
 			// TODO: add error case to br_table
@@ -240,33 +232,34 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 			return out
 
 		case overloads.LogicalAnd:
-			// short-circuit lhs.
 			out = append(out, do(ops.Block, wasm.BlockType(wasm.ValueTypeI32)))
-			lhs, err := p.Plan(args[0])
-			if err != nil {
-				return nil, err
-			}
+			out = append(out, do(ops.Block, wasm.BlockType(wasm.ValueTypeI32)))
+			out = append(out, do(ops.I32Const, int32(0)))
+			out = append(out, do(ops.Block, wasm.BlockTypeEmpty))
+
+			// short-circuit lhs.
+			lhs := p.Plan(args[0])
 			out = append(out, lhs...)
 
-			// if value is 0, break
-
+			// if value is 0, break, return false
+			// if value is 1 return RHS
+			// TODO:
+			// if value is >=2, evaluate RHS return either false or error
+			out = append(out, do(ops.BrTable, uint32(2), uint32(1), uint32(0), uint32(0)))
 			out = append(out, do(ops.End))
 
-			lVal := and.lhs.Eval(ctx)
-			lBool, lok := lVal.(types.Bool)
-			if lok && lBool == types.False {
-				return types.False
-			}
-			// short-circuit on rhs.
-			rVal := and.rhs.Eval(ctx)
-			rBool, rok := rVal.(types.Bool)
-			if rok && rBool == types.False {
-				return types.False
-			}
-			// return if both sides are bool true.
-			if lok && rok {
-				return types.True
-			}
+			// short-circuit rhs
+			out = append(out, do(ops.Drop))
+			rhs := p.Plan(args[1])
+			out = append(out, rhs...)
+			out = append(out, do(ops.Br, uint32(1)))
+			out = append(out, do(ops.End))
+
+			// false value
+			out = append(out, do(ops.I32Const, int32(0)))
+			out = append(out, do(ops.End))
+
+			return out
 
 		case overloads.AddInt64:
 			out = append(out, p.Plan(args[0])...)
@@ -294,6 +287,11 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 			out = append(out, p.Plan(args[0])...)
 			out = append(out, p.Plan(args[1])...)
 			out = append(out, do(ops.F64Div))
+			return out
+		case overloads.DivideInt64:
+			out = append(out, p.Plan(args[0])...)
+			out = append(out, p.Plan(args[1])...)
+			out = append(out, do(ops.I64DivS))
 			return out
 
 		case overloads.DoubleToInt:
@@ -501,13 +499,6 @@ func (p *planner) planCreateObj(expr *exprpb.Expr) (Interpretable, error) {
 	obj := expr.GetStructExpr()
 	typeName := obj.MessageName
 	var defined bool
-	for _, qualifiedTypeName := range p.pkg.ResolveCandidateNames(typeName) {
-		if _, found := p.provider.FindType(qualifiedTypeName); found {
-			typeName = qualifiedTypeName
-			defined = true
-			break
-		}
-	}
 	if !defined {
 		return nil, fmt.Errorf("unknown type: %s", typeName)
 	}
@@ -584,57 +575,6 @@ func (p *planner) getQualifiedID(sel *exprpb.Expr_Select) (string, bool) {
 	return ident, validIdent
 }
 
-// idResolver returns a function that resolves an identifier to its appropriate namespace.
-func (p *planner) idResolver(ident string) func(Activation) (ref.Val, bool) {
-	return func(ctx Activation) (ref.Val, bool) {
-		for _, id := range p.pkg.ResolveCandidateNames(ident) {
-			if object, found := ctx.ResolveName(id); found {
-				return object, found
-			}
-			if typeIdent, found := p.provider.FindIdent(id); found {
-				return typeIdent, found
-			}
-		}
-		return nil, false
-	}
-}
-
-type evalIdent struct {
-	id        int64
-	name      string
-	provider  ref.TypeProvider
-	resolveID func(Activation) (ref.Val, bool)
-}
-
-// ID implements the Interpretable interface method.
-func (id *evalIdent) ID() int64 {
-	return id.id
-}
-
-// Eval implements the Interpretable interface method.
-func (id *evalIdent) Eval(ctx Activation) ref.Val {
-	idName := id.name
-	if id.resolveID != nil {
-		// When the resolveID function is non-nil, the name could be relative
-		// to the container.
-		if val, found := id.resolveID(ctx); found {
-			return val
-		}
-	} else {
-		// Resolve the simple name directly as a type or ident.
-		val, found := ctx.ResolveName(idName)
-		if found {
-			return val
-		}
-		typeVal, found := id.provider.FindIdent(idName)
-		if found {
-			return typeVal
-		}
-	}
-	return types.Unknown{id.id}
-
-}
-
 type evalSelect struct {
 	id        int64
 	op        Interpretable
@@ -690,53 +630,6 @@ func (test *evalTestOnly) Eval(ctx Activation) ref.Val {
 	*/
 	return types.ValOrErr(types.Bool(true), "invalid type for field selection.")
 
-}
-
-type evalOr struct {
-	id  int64
-	lhs Interpretable
-	rhs Interpretable
-}
-
-// ID implements the Interpretable interface method.
-func (or *evalOr) ID() int64 {
-	return or.id
-}
-
-// Eval implements the Interpretable interface method.
-func (or *evalOr) Eval(ctx Activation) ref.Val {
-	// short-circuit lhs.
-	lVal := or.lhs.Eval(ctx)
-	lBool, lok := lVal.(types.Bool)
-	if lok && lBool == types.True {
-		return types.True
-	}
-	// short-circuit on rhs.
-	rVal := or.rhs.Eval(ctx)
-	rBool, rok := rVal.(types.Bool)
-	if rok && rBool == types.True {
-		return types.True
-	}
-	// return if both sides are bool false.
-	if lok && rok {
-		return types.False
-	}
-	// TODO: return both values as a set if both are unknown or error.
-	// prefer left unknown to right unknown.
-	if types.IsUnknown(lVal) {
-		return lVal
-	}
-	if types.IsUnknown(rVal) {
-		return rVal
-	}
-	// if the left-hand side is non-boolean return it as the error.
-	return types.ValOrErr(lVal, "no such overload")
-}
-
-type evalAnd struct {
-	id  int64
-	lhs Interpretable
-	rhs Interpretable
 }
 
 type evalZeroArity struct {

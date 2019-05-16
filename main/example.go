@@ -3,14 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
-	"reflect"
 
-	"github.com/go-interpreter/wagon/disasm"
 	"github.com/go-interpreter/wagon/exec"
-	"github.com/go-interpreter/wagon/wasm"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
+	"github.com/google/cel-go/checker/decls"
 	gen "github.com/google/cel-go/wasm"
 )
 
@@ -24,7 +22,14 @@ func main() {
 		input = os.Args[1]
 	}
 
-	env, _ := cel.NewEnv()
+	env, _ := cel.NewEnv(cel.Declarations(
+		decls.NewIdent("ai", decls.Int, nil),
+		decls.NewIdent("ar", decls.NewMapType(decls.String, decls.String), nil),
+		decls.NewIdent("headers.ip", decls.String, nil),
+		decls.NewIdent("headers.path", decls.String, nil),
+		decls.NewIdent("headers.token", decls.String, nil),
+	))
+
 	parsed, iss := env.Parse(input)
 	if iss != nil {
 		panic(iss.Err())
@@ -36,11 +41,17 @@ func main() {
 	expr, _ := cel.AstToCheckedExpr(checked)
 	fmt.Printf("checked %s\n", checker.Print(expr.Expr, expr))
 	prg, _ := env.Program(checked)
-	out, _, _ := prg.Eval(map[string]interface{}{})
+
+	activation := map[string]interface{}{
+		"ai": int64(42),
+	}
+
+	out, _, _ := prg.Eval(activation)
 	fmt.Printf("CEL value: %v\n", out)
 
-	instrs := gen.Plan(expr)
-	module := makeModule(assemble(instrs))
+	instrs, idents := gen.Plan(expr)
+	module, host := gen.MakeModule(instrs, idents)
+	host.Values = activation
 	vm, err := exec.NewVM(module)
 	if err != nil {
 		panic(err)
@@ -50,56 +61,4 @@ func main() {
 		panic(err)
 	}
 	fmt.Printf("WASM value: %v\n", o)
-}
-
-func assemble(instrs []disasm.Instr) []byte {
-	out, err := disasm.Assemble(instrs)
-	if err != nil {
-		panic(err)
-	}
-	return out
-}
-
-// a host function that can be called by WASM code.
-func testHostFunction(proc *exec.Process) {
-	fmt.Println("executing host function")
-}
-
-func makeModule(code []byte) *wasm.Module {
-	m := wasm.NewModule()
-
-	env := wasm.FunctionSig{
-		Form:        0,
-		ParamTypes:  []wasm.ValueType{},
-		ReturnTypes: []wasm.ValueType{},
-	}
-	main := wasm.FunctionSig{
-		Form:        0,
-		ParamTypes:  []wasm.ValueType{},
-		ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
-	}
-
-	// The body of the start function, that should only
-	// call the host function
-	fb := wasm.FunctionBody{
-		Module: m,
-		Locals: []wasm.LocalEntry{},
-		Code:   code,
-	}
-
-	m.FunctionIndexSpace = []wasm.Function{
-		{
-			Sig:  &main,
-			Body: &fb,
-		},
-		{
-			Sig:  &env,
-			Host: reflect.ValueOf(testHostFunction),
-		},
-	}
-	m.Code = &wasm.SectionCode{
-		Bodies: []wasm.FunctionBody{fb},
-	}
-
-	return m
 }
