@@ -98,7 +98,7 @@ func (p *planner) planIdent(name string, typ *exprpb.Type) Instructions {
 	s := p.StringData(name)
 	out = append(out, do(ops.I32Const, s.off))
 	out = append(out, do(ops.I32Const, int32(len(s.val))))
-	out = append(out, do(ops.Call, LoadI64))
+	out = append(out, do(ops.Call, LoadIdent))
 	return out
 }
 
@@ -304,14 +304,25 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 	switch len(args) {
 	case 1:
 		out = append(out, do(ops.Call, Invoke1))
-		return out
 	case 2:
 		out = append(out, do(ops.Call, Invoke2))
-		return out
+	default:
+		panic(fmt.Sprintf("not implemented: overload %q function %q\n", oName, fnName))
 	}
 
-	panic(fmt.Sprintf("not implemented: overload %q function %q\n", oName, fnName))
+	// TODO: make sure it is a stack value
+	typ, ok := p.typeMap[expr.Id]
+	if ok {
+		switch t := typ.TypeKind.(type) {
+		case *exprpb.Type_Primitive:
+			switch t.Primitive {
+			case exprpb.Type_INT64:
+				out = append(out, do(ops.Call, LoadI64))
+			}
+		}
+	}
 
+	return out
 }
 
 // planConst generates a constant valued Interpretable.

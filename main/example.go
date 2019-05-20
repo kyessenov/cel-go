@@ -10,6 +10,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
 	"github.com/google/cel-go/checker/decls"
+	"github.com/google/cel-go/common/types"
 	gen "github.com/google/cel-go/wasm"
 )
 
@@ -64,5 +65,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("WASM value: %v\n", o)
+
+	switch out.Type() {
+	case types.IntType:
+		fmt.Printf("WASM int value: %v\n", o)
+	default:
+		h := host.Heap[o.(uint64)-1]
+		fmt.Printf("WASM value: %v\n", h)
+	}
 }

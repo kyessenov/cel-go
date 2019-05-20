@@ -27,8 +27,9 @@ import (
 const (
 	Select uint32 = iota + 1
 	TestSelect
-	LoadI64
+	LoadIdent
 	StoreS
+	LoadI64
 	StoreI64
 	Invoke1
 	Invoke2
@@ -52,7 +53,7 @@ type HostFunctions struct {
 }
 
 // I64 values are made concrete for integers
-func (host *HostFunctions) LoadI64(proc *exec.Process, o, l int32) int64 {
+func (host *HostFunctions) LoadIdent(proc *exec.Process, o, l int32) int64 {
 	s := make([]byte, l)
 	proc.ReadAt(s, int64(o))
 
@@ -80,6 +81,17 @@ func (host *HostFunctions) StoreS(proc *exec.Process, o, l int32) int64 {
 	proc.ReadAt(s, int64(o))
 	host.Heap = append(host.Heap, types.String(s))
 	return int64(len(host.Heap))
+}
+
+func (host *HostFunctions) LoadI64(proc *exec.Process, v int64) int64 {
+	val := host.Heap[v-1]
+
+	switch val.Type() {
+	case types.IntType:
+		return int64(val.(types.Int))
+	}
+
+	return 0
 }
 
 func (host *HostFunctions) StoreI64(proc *exec.Process, v int64) int64 {
@@ -206,7 +218,7 @@ func MakeModule(instrs []disasm.Instr, strings map[string]*String) (*wasm.Module
 				ParamTypes:  []wasm.ValueType{wasm.ValueTypeI32, wasm.ValueTypeI32},
 				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
 			},
-			Host: reflect.ValueOf(host.LoadI64),
+			Host: reflect.ValueOf(host.LoadIdent),
 		},
 		{
 			Sig: &wasm.FunctionSig{
@@ -214,6 +226,13 @@ func MakeModule(instrs []disasm.Instr, strings map[string]*String) (*wasm.Module
 				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
 			},
 			Host: reflect.ValueOf(host.StoreS),
+		},
+		{
+			Sig: &wasm.FunctionSig{
+				ParamTypes:  []wasm.ValueType{wasm.ValueTypeI64},
+				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
+			},
+			Host: reflect.ValueOf(host.LoadI64),
 		},
 		{
 			Sig: &wasm.FunctionSig{
