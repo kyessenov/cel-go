@@ -1,12 +1,19 @@
 package wasm
 
 import (
+	"fmt"
 	"reflect"
 
 	"github.com/go-interpreter/wagon/disasm"
 	"github.com/go-interpreter/wagon/exec"
 	"github.com/go-interpreter/wagon/wasm"
 	ops "github.com/go-interpreter/wagon/wasm/operators"
+
+	"github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/common/types/traits"
+	"github.com/google/cel-go/interpreter"
+	"github.com/google/cel-go/interpreter/functions"
 )
 
 // Data type mapping:
@@ -38,88 +45,87 @@ func assemble(instrs []disasm.Instr) []byte {
 
 // Host manages the data and hands out pointers to the data
 type HostFunctions struct {
-	Values map[string]interface{}
-	Heap   []interface{}
+	Values      map[string]interface{}
+	Heap        []ref.Val
+	Dispatcher  interpreter.Dispatcher
+	TypeAdapter ref.TypeAdapter
 }
 
+// I64 values are made concrete for integers
 func (host *HostFunctions) LoadI64(proc *exec.Process, o, l int32) int64 {
 	s := make([]byte, l)
 	proc.ReadAt(s, int64(o))
 
-	val, ok := host.Values[string(s)]
+	native, ok := host.Values[string(s)]
+
+	// TODO: missing activation value?
 	if !ok {
 		return 0
 	}
 
-	switch out := val.(type) {
-	case int64:
-		return out
+	val := host.TypeAdapter.NativeToValue(native)
+
+	// TODO: manage other primitive types
+	switch val.Type() {
+	case types.IntType:
+		return int64(val.(types.Int))
 	default:
 		host.Heap = append(host.Heap, val)
 		return int64(len(host.Heap))
-		// TODO: manage other primitive types
 	}
 }
 
 func (host *HostFunctions) StoreS(proc *exec.Process, o, l int32) int64 {
 	s := make([]byte, l)
 	proc.ReadAt(s, int64(o))
-	host.Heap = append(host.Heap, string(s))
+	host.Heap = append(host.Heap, types.String(s))
 	return int64(len(host.Heap))
 }
 
 // TODO: need to realize an error value on the heap
-func (host *HostFunctions) Invoke2(proc *exec.Process, a0, a1 int64) int64 {
-	arg0 := host.Heap[a0]
-	arg1 := host.Heap[a1]
-	_ = arg0
-	_ = arg1
-	return 0
+func (host *HostFunctions) Invoke2(proc *exec.Process, fo, fl int32, h0, h1 int64) int64 {
+	fn := make([]byte, fl)
+	proc.ReadAt(fn, int64(fo))
+	impl, _ := host.Dispatcher.FindOverload(string(fn))
+	if impl == nil {
+		panic(fmt.Sprintf("missing overload %s", string(fn)))
+	}
+	if impl.Binary == nil {
+		panic("missing binary impl")
+	}
+
+	arg0 := host.Heap[h0-1]
+	arg1 := host.Heap[h1-1]
+
+	out := impl.Binary(arg0, arg1)
+	host.Heap = append(host.Heap, out)
+	return int64(len(host.Heap))
 }
 
 func (host *HostFunctions) Select(proc *exec.Process, h int64, o, l int32) int64 {
-	if h <= 0 || h > int64(len(host.Heap)) {
-		// cannot find heap object
-		return 0
-	}
 	rcv := host.Heap[h-1]
-	m, ok := rcv.(map[string]string)
-	if !ok {
-		return 0
-	}
-
 	s := make([]byte, l)
 	proc.ReadAt(s, int64(o))
-	val := m[string(s)]
+	val := rcv.(traits.Indexer).Get(types.String(s))
+
 	host.Heap = append(host.Heap, val)
 	return int64(len(host.Heap))
 }
 
 func (host *HostFunctions) TestSelect(proc *exec.Process, h int64, o, l int32) int32 {
-	if h <= 0 || h > int64(len(host.Heap)) {
-		// cannot find heap object
-		return 0
-	}
 	rcv := host.Heap[h-1]
-	m, ok := rcv.(map[string]string)
-	if !ok {
-		return 0
-	}
-
 	s := make([]byte, l)
 	proc.ReadAt(s, int64(o))
-	_, ok = m[string(s)]
-	if ok {
-		return 1
-	} else {
+	val := rcv.(traits.Indexer).Get(types.String(s))
+
+	if types.IsError(val) {
 		return 0
+	} else {
+		return 1
 	}
 }
 
 func (host *HostFunctions) MapSize(proc *exec.Process, h int64) int64 {
-	if h <= 0 || h > int64(len(host.Heap)) {
-		return 0
-	}
 	val := host.Heap[h-1]
 	ref := reflect.ValueOf(val)
 	if ref.Kind() == reflect.Map {
@@ -133,7 +139,7 @@ func (host *HostFunctions) StringSize(proc *exec.Process, h int64) int64 {
 		return 0
 	}
 	val := host.Heap[h-1]
-	out, ok := val.(string)
+	out, ok := val.(types.String)
 	if ok {
 		return int64(len(out))
 	}
@@ -142,7 +148,11 @@ func (host *HostFunctions) StringSize(proc *exec.Process, h int64) int64 {
 
 func MakeModule(instrs []disasm.Instr, strings map[string]*String) (*wasm.Module, *HostFunctions) {
 	m := wasm.NewModule()
-	host := &HostFunctions{}
+	host := &HostFunctions{
+		Dispatcher:  interpreter.NewDispatcher(),
+		TypeAdapter: types.NewRegistry(),
+	}
+	host.Dispatcher.Add(functions.StandardOverloads()...)
 
 	// stop main invocation that drops the value
 	m.Start = nil
@@ -206,10 +216,10 @@ func MakeModule(instrs []disasm.Instr, strings map[string]*String) (*wasm.Module
 		},
 		{
 			Sig: &wasm.FunctionSig{
-				ParamTypes:  []wasm.ValueType{wasm.ValueTypeI64, wasm.ValueTypeI64},
+				ParamTypes:  []wasm.ValueType{wasm.ValueTypeI32, wasm.ValueTypeI32, wasm.ValueTypeI64, wasm.ValueTypeI64},
 				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
 			},
-			Host: reflect.ValueOf(host.StoreS),
+			Host: reflect.ValueOf(host.Invoke2),
 		},
 		{
 			Sig:  &id,

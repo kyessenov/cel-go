@@ -288,7 +288,12 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 
 	// Load all arguments to the heap for overload invocation
 	fnName := call.Function
+	s := p.StringData(fnName)
+
 	out := make(Instructions, 0)
+	out = append(out,
+		do(ops.I32Const, s.off),
+		do(ops.I32Const, int32(len(s.val))))
 
 	for _, arg := range args {
 		out = append(out, p.Plan(arg)...)
