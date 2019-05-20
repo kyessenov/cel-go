@@ -272,15 +272,6 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 			out = append(out, do(ops.I64Eq))
 			return out
 
-		case overloads.SizeMap:
-			out = append(out, p.Plan(args[0])...)
-			out = append(out, do(ops.Call, MapSize))
-			return out
-		case overloads.SizeString:
-			out = append(out, p.Plan(args[0])...)
-			out = append(out, do(ops.Call, StringSize))
-			return out
-
 			// TODO: all the other functions...
 
 		}
@@ -301,6 +292,9 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 	}
 
 	switch len(args) {
+	case 1:
+		out = append(out, do(ops.Call, Invoke1))
+		return out
 	case 2:
 		out = append(out, do(ops.Call, Invoke2))
 		return out

@@ -29,9 +29,8 @@ const (
 	TestSelect
 	LoadI64
 	StoreS
+	Invoke1
 	Invoke2
-	MapSize
-	StringSize
 	Reserved
 )
 
@@ -82,6 +81,23 @@ func (host *HostFunctions) StoreS(proc *exec.Process, o, l int32) int64 {
 	return int64(len(host.Heap))
 }
 
+func (host *HostFunctions) Invoke1(proc *exec.Process, fo, fl int32, h0 int64) int64 {
+	fn := make([]byte, fl)
+	proc.ReadAt(fn, int64(fo))
+	impl, _ := host.Dispatcher.FindOverload(string(fn))
+	if impl == nil {
+		panic(fmt.Sprintf("missing overload %s", string(fn)))
+	}
+	if impl.Unary == nil {
+		panic("missing unary impl")
+	}
+
+	arg0 := host.Heap[h0-1]
+	out := impl.Unary(arg0)
+	host.Heap = append(host.Heap, out)
+	return int64(len(host.Heap))
+}
+
 // TODO: need to realize an error value on the heap
 func (host *HostFunctions) Invoke2(proc *exec.Process, fo, fl int32, h0, h1 int64) int64 {
 	fn := make([]byte, fl)
@@ -123,27 +139,6 @@ func (host *HostFunctions) TestSelect(proc *exec.Process, h int64, o, l int32) i
 	} else {
 		return 1
 	}
-}
-
-func (host *HostFunctions) MapSize(proc *exec.Process, h int64) int64 {
-	val := host.Heap[h-1]
-	ref := reflect.ValueOf(val)
-	if ref.Kind() == reflect.Map {
-		return int64(ref.Len())
-	}
-	return 0
-}
-
-func (host *HostFunctions) StringSize(proc *exec.Process, h int64) int64 {
-	if h <= 0 || h > int64(len(host.Heap)) {
-		return 0
-	}
-	val := host.Heap[h-1]
-	out, ok := val.(types.String)
-	if ok {
-		return int64(len(out))
-	}
-	return 0
 }
 
 func MakeModule(instrs []disasm.Instr, strings map[string]*String) (*wasm.Module, *HostFunctions) {
@@ -216,18 +211,17 @@ func MakeModule(instrs []disasm.Instr, strings map[string]*String) (*wasm.Module
 		},
 		{
 			Sig: &wasm.FunctionSig{
+				ParamTypes:  []wasm.ValueType{wasm.ValueTypeI32, wasm.ValueTypeI32, wasm.ValueTypeI64},
+				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
+			},
+			Host: reflect.ValueOf(host.Invoke1),
+		},
+		{
+			Sig: &wasm.FunctionSig{
 				ParamTypes:  []wasm.ValueType{wasm.ValueTypeI32, wasm.ValueTypeI32, wasm.ValueTypeI64, wasm.ValueTypeI64},
 				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
 			},
 			Host: reflect.ValueOf(host.Invoke2),
-		},
-		{
-			Sig:  &id,
-			Host: reflect.ValueOf(host.MapSize),
-		},
-		{
-			Sig:  &id,
-			Host: reflect.ValueOf(host.StringSize),
 		},
 	}
 
