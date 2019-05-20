@@ -289,6 +289,16 @@ func (p *planner) planCall(expr *exprpb.Expr) Instructions {
 	for _, arg := range args {
 		out = append(out, p.Plan(arg)...)
 		// TODO: make sure it is a heap value
+		typ, ok := p.typeMap[arg.Id]
+		if ok {
+			switch t := typ.TypeKind.(type) {
+			case *exprpb.Type_Primitive:
+				switch t.Primitive {
+				case exprpb.Type_INT64:
+					out = append(out, do(ops.Call, StoreI64))
+				}
+			}
+		}
 	}
 
 	switch len(args) {

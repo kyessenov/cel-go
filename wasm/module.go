@@ -29,6 +29,7 @@ const (
 	TestSelect
 	LoadI64
 	StoreS
+	StoreI64
 	Invoke1
 	Invoke2
 	Reserved
@@ -78,6 +79,11 @@ func (host *HostFunctions) StoreS(proc *exec.Process, o, l int32) int64 {
 	s := make([]byte, l)
 	proc.ReadAt(s, int64(o))
 	host.Heap = append(host.Heap, types.String(s))
+	return int64(len(host.Heap))
+}
+
+func (host *HostFunctions) StoreI64(proc *exec.Process, v int64) int64 {
+	host.Heap = append(host.Heap, types.Int(v))
 	return int64(len(host.Heap))
 }
 
@@ -208,6 +214,13 @@ func MakeModule(instrs []disasm.Instr, strings map[string]*String) (*wasm.Module
 				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
 			},
 			Host: reflect.ValueOf(host.StoreS),
+		},
+		{
+			Sig: &wasm.FunctionSig{
+				ParamTypes:  []wasm.ValueType{wasm.ValueTypeI64},
+				ReturnTypes: []wasm.ValueType{wasm.ValueTypeI64},
+			},
+			Host: reflect.ValueOf(host.StoreI64),
 		},
 		{
 			Sig: &wasm.FunctionSig{
