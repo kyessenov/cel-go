@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/go-interpreter/wagon/exec"
+	"github.com/go-interpreter/wagon/wast"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
@@ -43,14 +44,17 @@ func main() {
 	prg, _ := env.Program(checked)
 
 	activation := map[string]interface{}{
-		"ai": int64(42),
+		"ai":           int64(42),
+		"ar":           map[string]string{"x": "y", "z": "t"},
+		"headers.path": "/token",
 	}
 
 	out, _, _ := prg.Eval(activation)
 	fmt.Printf("CEL value: %v\n", out)
 
-	instrs, idents := gen.Plan(expr)
-	module, host := gen.MakeModule(instrs, idents)
+	instrs, strings := gen.Plan(expr)
+	module, host := gen.MakeModule(instrs, strings)
+	wast.WriteTo(os.Stdout, module)
 	host.Values = activation
 	vm, err := exec.NewVM(module)
 	if err != nil {
